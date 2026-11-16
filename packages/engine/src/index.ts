@@ -110,6 +110,23 @@ app.use(async (c, next) => {
   const { env, ctx, host } = c.env;
   const rejected = await host.admit?.(c.req.raw, env, ctx);
   if (rejected) return rejected;
+
+  const authToken = env.KITESURF_AUTH_TOKEN;
+  if (authToken) {
+    const url = new URL(c.req.url);
+    if (url.pathname === "/health") {
+      return next();
+    }
+    const authHeader = c.req.header("authorization");
+    const customHeader = c.req.header("x-kitesurf-token");
+    const queryToken = url.searchParams.get("token");
+    const bearer = authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+    const supplied = bearer || customHeader || queryToken;
+    if (!supplied || supplied !== authToken) {
+      return c.text("Unauthorized: missing or invalid authentication token\n", 401);
+    }
+  }
+
   await next();
 });
 
@@ -166,8 +183,9 @@ app.get("/", async (c, next) => {
     );
   }
   const host = c.req.header("host") ?? url.host;
+  const token = c.env.env.KITESURF_AUTH_TOKEN || url.searchParams.get("token") || undefined;
   return Response.redirect(
-    inspectorTargetUrl(inspectorBase, { url, host, initialUrl: query.url }),
+    inspectorTargetUrl(inspectorBase, { url, host, initialUrl: query.url, token }),
     302,
   );
 });
@@ -184,9 +202,11 @@ function discoveryVersion(c: Context<EngineApp>): Response {
   const url = new URL(c.req.url);
   const host = c.req.header("host") ?? url.host;
   const scheme = url.protocol === "https:" ? "wss" : "ws";
+  const token = c.env.env.KITESURF_AUTH_TOKEN || url.searchParams.get("token") || "";
+  const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
   return Response.json({
     ...VERSION_INFO,
-    webSocketDebuggerUrl: `${scheme}://${host}/devtools/browser`,
+    webSocketDebuggerUrl: `${scheme}://${host}/devtools/browser${tokenQuery}`,
   });
 }
 app.get("/json/version", discoveryVersion);
@@ -196,7 +216,9 @@ async function discoveryList(c: Context<EngineApp>): Promise<Response> {
   const url = new URL(c.req.url);
   const host = c.req.header("host") ?? url.host;
   const scheme = url.protocol === "https:" ? "wss" : "ws";
-  const wsUrl = `${scheme}://${host}/devtools/page/kitesurf`;
+  const token = c.env.env.KITESURF_AUTH_TOKEN || url.searchParams.get("token") || "";
+  const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
+  const wsUrl = `${scheme}://${host}/devtools/page/kitesurf${tokenQuery}`;
   const inspectorBase = await resolveInspectorBaseUrl(c.env.env);
   const entry: Record<string, unknown> = {
     id: "kitesurf",
@@ -212,7 +234,7 @@ async function discoveryList(c: Context<EngineApp>): Promise<Response> {
   // stays relative, like Chrome's own /json/list, which chrome://inspect accepts.
   entry.devtoolsFrontendUrl =
     (inspectorBase ?? CHROME_BUNDLED_INSPECTOR_URL).replace(/\/$/, "") +
-    `?${scheme}=${host}/devtools/page/kitesurf`;
+    `?${scheme}=${host}/devtools/page/kitesurf${tokenQuery}`;
   return Response.json([entry]);
 }
 app.get("/json", discoveryList);
