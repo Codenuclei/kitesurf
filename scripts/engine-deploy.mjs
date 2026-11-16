@@ -67,6 +67,8 @@ export async function stageDeploy(engineDir, out) {
   const flat = { ...rawConfig, main: "index.js", no_bundle: true, find_additional_modules: true };
   delete flat.$schema;
   delete flat.env;
+  delete flat.worker_loaders;
+  delete flat.limits;
   flat.assets = { ...rawConfig.assets, directory: "../assets" };
   // A --config=devtools build ships the frontend; point the inspector routes at it unless the
   // config names one. A `--var KITESURF_INSPECTOR_BASE_URL:<url>` argument still wins.
