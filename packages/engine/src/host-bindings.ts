@@ -8,6 +8,8 @@ export {};
 
 declare global {
   interface Env {
+    // Shared secret token to gate all CDP and discovery routes.
+    KITESURF_AUTH_TOKEN?: string;
     // Span recorder for deployed tracing; local runs use the OTLP exporter in
     // tracing-local.ts.
     HOST_TRACER?: import("./tracing.ts").Tracer;
