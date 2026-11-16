@@ -744,8 +744,19 @@ export async function handlePage(
       try {
         const reqHeaders: Record<string, string> = {
           "user-agent":
+            target.userAgentOverride ||
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "sec-ch-ua": '"Not A(Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": '"Linux"',
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
         };
         // A page-started navigation carries the initiating document's origin,
         // so SameSite=Strict is withheld on a cross-site top-level navigation
@@ -976,13 +987,28 @@ export async function handlePage(
           }
           target.html = html;
           releaseTargetDom(target);
-          target.docScan = traceSpan(
-            ctx.env.HOST_TRACER,
-            "navigate.scan_document",
-            () => scanDocument(html),
-            { bytes: html.length },
-          );
-          target.title = target.docScan.title;
+          if (!ctx.env.LOADER && html.length > 100_000) {
+            const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+            const title = titleMatch?.[1] ? titleMatch[1].trim() : "";
+            const baseMatch = /<base[^>]+href=["']?([^"'\s>]+)/i.exec(html);
+            target.docScan = {
+              title,
+              baseHref: baseMatch?.[1] ? baseMatch[1] : null,
+              metaCsp: [],
+              scripts: [],
+              iframes: [],
+              modulePreloads: [],
+              importMaps: [],
+            };
+          } else {
+            target.docScan = traceSpan(
+              ctx.env.HOST_TRACER,
+              "navigate.scan_document",
+              () => scanDocument(html),
+              { bytes: html.length },
+            );
+          }
+          target.title = target.docScan ? target.docScan.title : "";
           pageHtml = html;
         } else {
           const read = await readCappedBytes(resp, MAX_DOCUMENT_BYTES, ctx.connectionId);
@@ -1087,6 +1113,7 @@ export async function handlePage(
         emitCapturedExceptions(ctx, target, exceptions, req.sessionId);
         emitMutations(ctx, target, cdpMutations);
         if (target.pendingNavAbort === navAbort) target.pendingNavAbort = null;
+        ctx.browser.screencasts.get(target.targetId)?.wake?.();
         return navigateReply(target.frameId, loaderId);
       } catch (err) {
         const errorText = err instanceof Error ? err.message : String(err);
@@ -1300,27 +1327,11 @@ export async function handlePage(
           throw new Error("Page.captureScreenshot failed: renderer returned no bytes");
         }
 
-        let html: string | null = null;
-        const leased = ensureTargetDom(target);
-        if (leased) {
-          const epochAtLease = target.domEpoch;
-          target.dom = null;
-          try {
-            await inlineStylesheets(
-              leased,
-              pageUrl,
-              ctx.browser.sandboxOutbound,
-              ctx.connectionId,
-              {
-                cache: ctx.browser.styleCache,
-                tracker: ctx.browser.networkEvents,
-                loaderId: target.loaderId,
-                frameId: target.frameId,
-              },
-            );
+        let html: string | null = target.html ?? null;
+        if (!html) {
+          const leased = ensureTargetDom(target);
+          if (leased) {
             html = leased.outerHTML(0);
-          } finally {
-            returnScreenshotDomLease(target, leased, epochAtLease);
           }
         }
         if (!html) {
@@ -1328,8 +1339,12 @@ export async function handlePage(
         }
         const width = target.viewportWidth ?? DEFAULT_VIEWPORT_WIDTH;
         const height = target.viewportHeight ?? DEFAULT_VIEWPORT_HEIGHT;
-        const { renderHtmlToImage } = await import("../wasm.ts");
-        const bytes = renderHtmlToImage(html, pageUrl, width, height, format, quality);
+        const { renderHtmlToImage, ensureUaFonts } = await import("../wasm.ts");
+        if (ctx.env.FONT_ASSETS) {
+          await ensureUaFonts(ctx.env.FONT_ASSETS);
+        }
+        const cleanHtml = cleanHtmlForRender(html);
+        const bytes = renderHtmlToImage(cleanHtml, pageUrl, width, height, format, quality);
         if (bytes.length === 0) {
           return {
             data: TINY_TRANSPARENT_PNG_B64,
@@ -1378,6 +1393,36 @@ export async function handlePage(
         };
 
         if (!target.pageScript) {
+          const { createDom, SceneRasterizer, ensureUaFonts } = await import("../wasm.ts");
+          if (ctx.env.FONT_ASSETS) {
+            await ensureUaFonts(ctx.env.FONT_ASSETS);
+          }
+          const cleanHtml = cleanHtmlForRender(target.html || "");
+          const dom = createDom(cleanHtml, target.url || "https://kitesurf.local/");
+          const envelope = dom.recordPdfScenes(
+            pdfLayout.width,
+            pdfLayout.height,
+            pdfLayout.marginTopPx,
+            pdfLayout.marginRightPx,
+            pdfLayout.marginBottomPx,
+            pdfLayout.marginLeftPx,
+          );
+          if (envelope && envelope.length > 0) {
+            const rasterizer = new SceneRasterizer();
+            const pdfBytes = rasterizer.renderPdf(
+              envelope,
+              pdfLayout.width,
+              pdfLayout.height,
+              omitBackground,
+              pdfLayout.marginTopPx,
+              pdfLayout.marginRightPx,
+              pdfLayout.marginBottomPx,
+              pdfLayout.marginLeftPx,
+            );
+            if (pdfBytes && pdfBytes.length > 0) {
+              return { data: bytesToBase64(pdfBytes) };
+            }
+          }
           return {
             data: EMPTY_PDF_B64,
             error: "no PageScript for target (PDF requires live paint dom)",
@@ -1674,6 +1719,18 @@ function bytesToBase64(bytes: Uint8Array): string {
   return bytes.toBase64();
 }
 
+// Strips non-rendering scripts and caps oversized vector shapes on large pages
+// so Blitz layout fits in the Worker CPU budget.
+function cleanHtmlForRender(html: string): string {
+  if (!html || html.length < 50_000) return html;
+  let clean = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "");
+  clean = clean.replace(/<svg\b[^>]*>(?:(?!<\/svg>)[\s\S])*<\/svg>/gi, (match) => {
+    if (match.length > 8000) return '<svg viewBox="0 0 100 100"></svg>';
+    return match;
+  });
+  return clean;
+}
+
 function sanitizeBaseUrl(url: string): string {
   if (!url) return "https://kitesurf.local/";
   try {
@@ -1733,11 +1790,15 @@ async function pushNavigateToPageScriptInner(
   url: string,
   owesIframeInstalls = false,
 ): Promise<NavigatePushResult> {
+  const consoleAcc: ConsoleEntry[] = [];
+  if (!ctx.env.LOADER) {
+    target.navigateGeneration += 1;
+    return { console: consoleAcc };
+  }
   const docScan = target.docScan ?? scanDocument(html);
   const scriptBaseUrl = documentBaseUrl(url, docScan.baseHref);
   const preloadSeeds = modulePreloadSeeds(docScan.modulePreloads, scriptBaseUrl);
   target.wheelTeardownDepth += 1;
-  const consoleAcc: ConsoleEntry[] = [];
   try {
     await cancelAndRemoveTargetWheelQueues(ctx.browser, target.targetId);
 
@@ -5207,12 +5268,29 @@ async function screencastLoop(
     stopAndRemoveWheelQueue(ctx.browser, target.targetId, state.ownerSessionId, state.wheelQueue);
   };
   try {
-    const sendPlaceholder = async (): Promise<boolean> => {
+    let lastRenderedDocHtml = "";
+
+    const sendStaticFrameIfNeeded = async (): Promise<void> => {
+      if (state.frameSeq - state.lastAckedSeq >= state.maxInFlight) {
+        return;
+      }
+      const currentHtml = target.html || PLACEHOLDER_HTML;
+      if (
+        lastRenderedDocHtml === currentHtml &&
+        placeholderConfigurationVersion === state.appliedConfigurationVersion
+      ) {
+        return;
+      }
       try {
-        const { renderHtmlToImage } = await import("../wasm.ts");
+        const { renderHtmlToImage, ensureUaFonts } = await import("../wasm.ts");
+        if (ctx.env.FONT_ASSETS) {
+          await ensureUaFonts(ctx.env.FONT_ASSETS);
+        }
+        const pageUrl = target.url || "https://kitesurf.local/";
+        const cleanHtml = cleanHtmlForRender(currentHtml);
         const bytes = renderHtmlToImage(
-          PLACEHOLDER_HTML,
-          "https://kitesurf.local/",
+          cleanHtml,
+          pageUrl,
           state.maxWidth,
           state.maxHeight,
           state.format,
@@ -5222,29 +5300,21 @@ async function screencastLoop(
           bytes.length === 0 ||
           state.stopped ||
           ctx.browser.wsClosing ||
-          ctx.browser.screencasts.get(target.targetId) !== state ||
-          state.configurationVersion !== state.appliedConfigurationVersion
+          ctx.browser.screencasts.get(target.targetId) !== state
         ) {
-          return false;
+          return;
         }
         emitFrame(bytes, -1);
-        return true;
+        lastRenderedDocHtml = currentHtml;
+        placeholderConfigurationVersion = state.appliedConfigurationVersion;
       } catch (err) {
-        console.warn("kitesurf: placeholder frame render threw", err);
-        return false;
+        console.warn("kitesurf: static screencast frame render threw", err);
       }
     };
 
-    const sendPlaceholderIfNeeded = async (): Promise<void> => {
-      if (
-        placeholderConfigurationVersion === state.appliedConfigurationVersion ||
-        state.frameSeq - state.lastAckedSeq >= state.maxInFlight
-      ) {
-        return;
-      }
-      if (await sendPlaceholder()) {
-        placeholderConfigurationVersion = state.appliedConfigurationVersion;
-      }
+    const sendPlaceholder = async (): Promise<boolean> => {
+      await sendStaticFrameIfNeeded();
+      return true;
     };
 
     const emitFrame = (bytes: Uint8Array, mutationSeq: number, scrollX = 0, scrollY = 0) => {
@@ -5408,12 +5478,13 @@ async function screencastLoop(
       }
 
       if (!target.pageScript) {
-        await sendPlaceholderIfNeeded();
+        await sendStaticFrameIfNeeded();
         if (inFlight) {
           const stale = inFlight.promise;
           inFlight = null;
           await stale.catch(() => {});
         }
+        await nap(500);
         continue;
       }
 

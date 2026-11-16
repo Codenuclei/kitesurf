@@ -1545,6 +1545,12 @@ export function buildForwardRequest({
   }
   if (!headers.has("user-agent")) headers.set("user-agent", BROWSER_UA);
   if (!headers.has("accept")) headers.set("accept", defaultAcceptFor(resourceType));
+  if (!headers.has("accept-language")) headers.set("accept-language", "en-US,en;q=0.9");
+  if (!headers.has("sec-ch-ua")) {
+    headers.set("sec-ch-ua", '"Not A(Brand";v="99", "Google Chrome";v="147", "Chromium";v="147"');
+    headers.set("sec-ch-ua-mobile", "?0");
+    headers.set("sec-ch-ua-platform", '"macOS"');
+  }
   // The fetch shim adds Origin where Fetch requires it (non-GET, cross-origin); the
   // gateway keeps the header but supplies the committed value, not the page's.
   if (pageRealm && original.headers.has("origin")) headers.set("origin", pageOrigin || "null");
