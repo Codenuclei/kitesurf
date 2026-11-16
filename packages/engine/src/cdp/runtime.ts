@@ -296,9 +296,30 @@ export async function handleRuntime(ctx: DispatchCtx, req: CdpRequest): Promise<
       }
       const ps = oopifStub ?? (await readyPageScript(ctx, target));
       if (!ps) {
-        return loaderFailureResponse(
-          new Error("Runtime.evaluate requires an attached page target"),
-        );
+        try {
+          const { ks_eval_cdp } = await import("../wasm.ts");
+          const raw = await ks_eval_cdp(expression, awaitPromise, returnByValue);
+          if (typeof raw === "string") {
+            try {
+              const parsed = JSON.parse(raw);
+              if (parsed.k === "val") {
+                const val = JSON.parse(parsed.j);
+                return remoteObjectFromValue(val, returnByValue);
+              } else if (parsed.k === "undef") {
+                return remoteObjectFromValue(undefined, returnByValue);
+              } else if (parsed.k === "big") {
+                return { result: { type: "bigint", unserializableValue: `${parsed.v}n` } };
+              } else if (parsed.k === "fn") {
+                return { result: { type: "function", description: parsed.d } };
+              } else if (parsed.k === "obj") {
+                return { result: { type: "object", description: parsed.d } };
+              }
+            } catch {}
+          }
+          return remoteObjectFromValue(raw, returnByValue);
+        } catch (evalErr) {
+          return loaderFailureResponse(evalErr);
+        }
       }
       try {
         const result = await traceSpan(
