@@ -11,12 +11,59 @@ import { setDomFactory } from "./cdp/dom-release.ts";
 import {
   initSync,
   DomHandle,
+  SceneRasterizer,
+  register_ua_fonts,
+  ks_eval_cdp,
   ks_parse_stylesheet_structured,
   ks_render_html_to_image,
   ks_scan_document,
   stripFontForShaping as ks_strip_font_for_shaping,
   __setBridgeFetchResource,
 } from "kitesurf-core";
+
+let uaFontsLoaded = false;
+let uaFontsLoading: Promise<void> | null = null;
+
+// Fetches and registers standard UA fonts for in-worker rendering.
+export async function ensureUaFonts(
+  fontAssets?: { fetch(req: Request): Promise<Response> } | null,
+): Promise<void> {
+  if (uaFontsLoaded) return;
+  if (uaFontsLoading) return uaFontsLoading;
+  ensureInit();
+  if (!fontAssets) return;
+  uaFontsLoading = (async () => {
+    try {
+      const fetchFont = async (path: string): Promise<Uint8Array> => {
+        const resp = await fontAssets.fetch(
+          new Request(`https://kitesurf.invalid${path}`, { method: "GET" }),
+        );
+        if (!resp.ok) {
+          throw new Error(`fetchFont ${path} HTTP ${resp.status}`);
+        }
+        return new Uint8Array(await resp.arrayBuffer());
+      };
+      const [sans, sansItalic, serif, mono] = await Promise.all([
+        fetchFont("/fonts/NotoSans.ttf"),
+        fetchFont("/fonts/NotoSans-Italic.ttf"),
+        fetchFont("/fonts/NotoSerif.ttf").catch(() => new Uint8Array(0)),
+        fetchFont("/fonts/NotoSansMono.ttf").catch(() => new Uint8Array(0)),
+      ]);
+      register_ua_fonts(sans, sansItalic, serif, mono);
+      uaFontsLoaded = true;
+    } catch (err) {
+      console.warn(
+        "[kitesurf-wasm] ensureUaFonts failed:",
+        err instanceof Error ? err.message : String(err),
+      );
+    } finally {
+      uaFontsLoading = null;
+    }
+  })();
+  return uaFontsLoading;
+}
+
+export { SceneRasterizer, ks_eval_cdp };
 
 let coreWasmMemory: WebAssembly.Memory | null = null;
 let coreWasmInitialBytes = 0;
